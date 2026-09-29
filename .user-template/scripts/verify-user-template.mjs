@@ -1,0 +1,217 @@
+#!/usr/bin/env node
+/**
+ * Verifies this user template repository the same way Galascribe verifies any
+ * generated publication repository: every Gala document schema-valid,
+ * every content file's frontmatter schema-valid, the real
+ * `@rathnasgala2/publish-action` `validate` and `build` commands succeeding
+ * against this directory, the welcome article's text present in the built
+ * HTML, and the caller workflow byte-identical to `publish`'s published
+ * contract.
+ *
+ * This file lives under `.user-template/` together with `USER-TEMPLATE.md` because it
+ * is workspace-development tooling, not something a person's generated
+ * publication repository needs to write an article. Galascribe deletes
+ * `.user-template/` in the identity commit it makes right after generating a
+ * repository from this user template.
+ *
+ * Sibling repositories (`schema`, `publish`) are resolved the same way
+ * `publish-action` itself resolves its own siblings (`template`,
+ * `theme-*`): `WORKSPACE_ROOT` when set, otherwise the fixed relative
+ * default from this file's own location.
+ *
+ * @module
+ */
+
+import { readFile, readdir } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const THIS_FILE_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
+// .user-template/scripts/ -> .user-template/ -> <repository root> -> v2/
+const DEFAULT_RELATIVE_WORKSPACE_ROOT = '../../../';
+
+function resolveWorkspaceRoot() {
+  const override = process.env.WORKSPACE_ROOT;
+  if (override && override.length > 0) {
+    return path.resolve(override);
+  }
+  return path.resolve(THIS_FILE_DIRECTORY, DEFAULT_RELATIVE_WORKSPACE_ROOT);
+}
+
+const workspaceRoot = resolveWorkspaceRoot();
+const repositoryDirectory = path.resolve(THIS_FILE_DIRECTORY, '../../');
+const schemaRoot = path.join(workspaceRoot, 'schema');
+const publishRoot = path.join(workspaceRoot, 'publish');
+const publishActionRoot = path.join(
+  publishRoot,
+  'packages',
+  'publish-action',
+);
+
+/** @type {string[]} */
+const failures = [];
+
+function report(label, ok, detail) {
+  const status = ok ? 'PASS' : 'FAIL';
+  console.log(`[${status}] ${label}${detail ? ` — ${detail}` : ''}`);
+  if (!ok) failures.push(label);
+}
+
+async function main() {
+  console.log(`workspace root: ${workspaceRoot}`);
+  console.log(`repository:     ${repositoryDirectory}`);
+
+  const { validateGalaDocument } = await import(
+    pathToFileURL(path.join(schemaRoot, 'src', 'index.js')).href
+  );
+
+  // 1. Schema-validate every Gala document.
+  const documents = [
+    ['urn:gala:schema:repository:2.0.0', 'gala/repository.json'],
+    ['urn:gala:schema:publication:2.0.0', 'gala/publication.json'],
+    ['urn:gala:schema:navigation:2.0.0', 'gala/navigation.json'],
+    ['urn:gala:schema:appearance:2.0.0', 'gala/appearance.json'],
+    ['urn:gala:schema:lock:2.0.0', 'gala.lock.json'],
+  ];
+  const authorFiles = await readdir(
+    path.join(repositoryDirectory, 'gala', 'authors'),
+  );
+  for (const name of authorFiles.filter((f) => f.endsWith('.json'))) {
+    documents.push(['urn:gala:schema:author:2.0.0', `gala/authors/${name}`]);
+  }
+  for (const [schemaId, relativePath] of documents) {
+    const value = JSON.parse(
+      await readFile(path.join(repositoryDirectory, relativePath), 'utf8'),
+    );
+    const result = validateGalaDocument(schemaId, value);
+    report(
+      `schema: ${relativePath}`,
+      Boolean(result.valid),
+      result.valid ? undefined : JSON.stringify(result.diagnostics),
+    );
+  }
+
+  // 2. Schema-validate every content file's frontmatter.
+  const require = createRequire(
+    pathToFileURL(path.join(publishActionRoot, 'package.json')).href,
+  );
+  const YAML = require('yaml');
+  const contentFiles = (
+    await readdir(path.join(repositoryDirectory, 'content'))
+  ).filter((f) => f.endsWith('.md'));
+  for (const name of contentFiles) {
+    const text = await readFile(
+      path.join(repositoryDirectory, 'content', name),
+      'utf8',
+    );
+    const match = text.match(/^---\n([\s\S]*?)\n---\n/);
+    if (!match) {
+      report(`frontmatter: content/${name}`, false, 'no frontmatter fence found');
+      continue;
+    }
+    const frontmatter = YAML.parse(match[1]);
+    const result = validateGalaDocument(
+      'urn:gala:schema:content-frontmatter:2.0.0',
+      frontmatter,
+    );
+    report(
+      `frontmatter: content/${name}`,
+      Boolean(result.valid),
+      result.valid ? undefined : JSON.stringify(result.diagnostics),
+    );
+  }
+
+  // 3. Run the real publish-action `validate` command.
+  const { runValidate } = await import(
+    pathToFileURL(
+      path.join(publishActionRoot, 'src', 'commands', 'validate.js'),
+    ).href
+  );
+  const validateResult = await runValidate({ repositoryDirectory });
+  report(
+    'publish-action validate',
+    validateResult.resultCode === 'SUCCESS',
+    JSON.stringify(validateResult.findings ?? []),
+  );
+
+  // 4. Run the real publish-action `build` command.
+  const { runBuild } = await import(
+    pathToFileURL(path.join(publishActionRoot, 'src', 'commands', 'build.js'))
+      .href,
+  );
+  const outputDirectory = path.join(
+    repositoryDirectory,
+    '.gala',
+    'verify-output',
+  );
+  const workDirectory = path.join(repositoryDirectory, '.gala', 'verify-work');
+  const buildResult = await runBuild({
+    repositoryDirectory,
+    outputDirectory,
+    workDirectory,
+  });
+  report(
+    'publish-action build',
+    buildResult.resultCode === 'SUCCESS',
+    JSON.stringify(buildResult.findings ?? []),
+  );
+
+  // 5. Confirm the welcome article's text made it into the built HTML.
+  if (buildResult.resultCode === 'SUCCESS') {
+    const welcomeHtmlPath = path.join(
+      outputDirectory,
+      'welcome-to-your-publication',
+      'index.html',
+    );
+    const html = await readFile(welcomeHtmlPath, 'utf8');
+    report(
+      'welcome article text present in built HTML',
+      html.includes(
+        'This is the first article in your new Galascribe publication',
+      ),
+      welcomeHtmlPath,
+    );
+  } else {
+    report('welcome article text present in built HTML', false, 'build did not succeed');
+  }
+
+  // 6. The caller workflow must be byte-identical to publish's own contract.
+  const callerPath = path.join(
+    repositoryDirectory,
+    '.github',
+    'workflows',
+    'gala-publish-v2.yml',
+  );
+  const contractPath = path.join(
+    publishRoot,
+    'docs',
+    'callers',
+    'gala-publish-v2.yml',
+  );
+  const [callerBytes, contractBytes] = await Promise.all([
+    readFile(callerPath),
+    readFile(contractPath),
+  ]);
+  const digest = (buf) => createHash('sha256').update(buf).digest('hex');
+  report(
+    'caller workflow byte-identical to publish/docs/callers/gala-publish-v2.yml',
+    digest(callerBytes) === digest(contractBytes),
+    `${digest(callerBytes)} vs ${digest(contractBytes)}`,
+  );
+
+  console.log('');
+  if (failures.length > 0) {
+    console.error(`${failures.length} check(s) failed:`);
+    for (const failure of failures) console.error(`  - ${failure}`);
+    process.exitCode = 1;
+  } else {
+    console.log('All checks passed.');
+  }
+}
+
+main().catch((error) => {
+  console.error(error.stack ?? String(error));
+  process.exitCode = 1;
+});
