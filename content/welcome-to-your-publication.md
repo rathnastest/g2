@@ -9,9 +9,8 @@ authors:
 - 01a0ec25-f446-73b0-986c-c84ebc2404d6
 tags:
 - welcome
-status: published
+status: draft
 createdAt: '2026-09-29T07:51:45.478Z'
-publishedAt: '2026-09-27T00:00:00.000Z'
 slug: welcome-to-your-publication
 redirects: []
 extensions: {}
